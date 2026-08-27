@@ -202,7 +202,7 @@ Current test suite:
 * `Agent.test.ts` — 7 tests
 * `ConsoleApprovalHandler.test.ts` — 5 tests
 
-**Total: 60 tests passing across 9 test files.**
+**Total: 416 tests across 30 test files.**
 
 ---
 
