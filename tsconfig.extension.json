@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "rootDir": "src",
+    "outDir": "dist-ext",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "declaration": false,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "lib": ["ES2022"],
+    "types": ["node", "vscode"]
+  },
+  "include": [
+    "src/extension/**/*.ts",
+    "src/agent/**/*.ts",
+    "src/llm/**/*.ts",
+    "src/tools/**/*.ts",
+    "src/security/**/*.ts",
+    "src/permissions/**/*.ts",
+    "src/workspace/**/*.ts",
+    "src/audit/**/*.ts",
+    "src/approval/**/*.ts",
+    "src/config/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "dist-ext",
+    "tests",
+    "src/index.ts"
+  ]
+}

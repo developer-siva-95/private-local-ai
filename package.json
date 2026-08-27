@@ -1,0 +1,276 @@
+{
+  "name": "private-ai-assistant",
+  "displayName": "Private AI Assistant",
+  "description": "Local AI coding assistant powered by Ollama. 100% private — no cloud, no telemetry, no external APIs. Chat, edit files, run commands with full security controls.",
+  "version": "0.1.0",
+  "publisher": "sivaramakrishnan",
+  "license": "UNLICENSED",
+  "author": "sivaramakrishnan",
+  "type": "module",
+  "main": "./dist-ext/extension.cjs",
+  "icon": "resources/icon.png",
+  "engines": {
+    "vscode": "^1.85.0",
+    "node": ">=20.0.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Snippets",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "chat",
+    "copilot",
+    "assistant",
+    "ollama",
+    "local",
+    "private",
+    "offline",
+    "llm",
+    "deepseek"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "build:ext": "node esbuild.extension.js",
+    "watch:ext": "node esbuild.extension.js --watch",
+    "package": "vsce package --no-dependencies",
+    "package:install": "vsce package --no-dependencies && code --install-extension private-ai-assistant-0.1.0.vsix"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "private-ai.openChat",
+        "title": "Open Chat",
+        "category": "Private AI",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "private-ai.clearHistory",
+        "title": "Clear Conversation",
+        "category": "Private AI",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "private-ai.showStatus",
+        "title": "Show Status",
+        "category": "Private AI",
+        "icon": "$(info)"
+      },
+      {
+        "command": "private-ai.askAboutSelection",
+        "title": "Ask Private AI about this selection",
+        "category": "Private AI",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "private-ai.askAboutFile",
+        "title": "Ask Private AI about this file",
+        "category": "Private AI",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "private-ai.explainSelection",
+        "title": "Explain This",
+        "category": "Private AI"
+      },
+      {
+        "command": "private-ai.fixSelection",
+        "title": "Fix This",
+        "category": "Private AI"
+      },
+      {
+        "command": "private-ai.generateTests",
+        "title": "Generate Tests",
+        "category": "Private AI"
+      },
+      {
+        "command": "private-ai.generateDocs",
+        "title": "Generate Documentation",
+        "category": "Private AI"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "private-ai.openChat",
+        "key": "ctrl+alt+i",
+        "mac": "cmd+alt+i"
+      },
+      {
+        "command": "private-ai.clearHistory",
+        "key": "ctrl+alt+l",
+        "mac": "cmd+alt+l",
+        "when": "view.privateAiChat.visible"
+      },
+      {
+        "command": "private-ai.askAboutSelection",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "private-ai.explainSelection",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "when": "editorHasSelection"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "submenu": "private-ai.editorSubmenu",
+          "group": "1_privateAi@1",
+          "when": "editorTextFocus"
+        }
+      ],
+      "private-ai.editorSubmenu": [
+        {
+          "command": "private-ai.askAboutSelection",
+          "group": "1_ask@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.explainSelection",
+          "group": "2_actions@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.fixSelection",
+          "group": "2_actions@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.generateTests",
+          "group": "3_generate@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.generateDocs",
+          "group": "3_generate@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.askAboutFile",
+          "group": "4_file@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "private-ai.askAboutFile",
+          "group": "8_privateAi",
+          "when": "!explorerResourceIsFolder"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "private-ai.openChat",
+          "group": "navigation",
+          "when": "resourceScheme == file"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "private-ai.askAboutSelection",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.explainSelection",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.fixSelection",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.generateTests",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.generateDocs",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "private-ai.askAboutFile",
+          "when": "editorIsOpen"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "private-ai.editorSubmenu",
+        "label": "Private AI"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "privateAiContainer",
+          "title": "Private AI",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "views": {
+      "privateAiContainer": [
+        {
+          "id": "privateAiChat",
+          "name": "Chat",
+          "type": "webview",
+          "contextualTitle": "Private AI"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Private AI",
+      "properties": {
+        "privateAi.ollamaUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Ollama server URL"
+        },
+        "privateAi.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:7b",
+          "description": "Ollama model name"
+        },
+        "privateAi.approvalTimeoutSeconds": {
+          "type": "number",
+          "default": 60,
+          "description": "Seconds to wait for approval before auto-denying"
+        },
+        "privateAi.debugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug logging"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.21.5",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
