@@ -1,40 +1,74 @@
 # Private AI Assistant
 
-A local AI coding assistant for VS Code. **100% private, no cloud, no telemetry.**
+A local AI coding assistant for VS Code, designed with a **security-first, fail-closed architecture**.
 
-Powered by [Ollama](https://ollama.ai) running on your machine. Chat with your AI, edit files, run commands — all with full security controls.
+The assistant runs primarily with a local LLM through [Ollama](https://ollama.com), keeping model inference on the user's machine. System-affecting operations are protected by centralized authorization, workspace boundaries, input validation, and explicit user approval.
 
 ---
 
 ## Features
 
-### 🔒 Fully Local & Private
-- No cloud APIs, no telemetry, no data leaves your machine
-- Powered by Ollama running locally
-- All logs stored in your workspace
+### 🔒 Local-First & Privacy-Focused
 
-### 💬 Copilot-Style Chat
+- Local LLM inference through Ollama
+- No cloud LLM is required for normal operation
+- No telemetry by design
+- Project data remains local unless a network-enabled feature is explicitly used
+- Security controls are enforced before tool execution
+
+### 💬 VS Code Chat
+
 - Sidebar chat panel
 - Streaming responses
 - Code block rendering with copy buttons
-- Timing display for every response
+- Response timing information
+- Conversation/session memory
 - Session compression for long conversations
 
-### 🛠️ Full File Operations
-- **Read files** — auto-approved for workspace files
-- **Write / Create** — visual diff preview before applying
-- **Edit / Patch** — visual diff preview before applying
-- **Delete** — explicit permission popup with full path
-- **Search files** across workspace
-- **Run commands** (npm, node, git, tsc — allowlist enforced)
+### 🛠️ File Operations
 
-### 🎯 Context-Aware
-- Knows your active file, cursor position, git branch
-- `@filename` mentions to reference specific files
-- Follow-up questions use conversation memory
-- Cross-session memory via `/remember` command
+- **Read files**
+- **Create and write files**
+- **Edit and patch files**
+- **Delete files**
+- **Search files**
+- **List directories**
+- Workspace boundary enforcement
+- Input validation
+- User approval for protected operations
+- Visual diff preview for file modifications
+
+### ⚙️ Controlled Command Execution
+
+- Command execution through a dedicated tool
+- Allowlist-based command restrictions
+- Security validation before execution
+- Explicit approval for protected operations
+- Execution timeouts and resource controls
+
+### 🔧 Git Integration
+
+- Git operations through a dedicated tool
+- Security checks before execution
+- Workspace-aware operations
+
+### 🌐 Controlled Web Access
+
+- Network access is isolated behind a dedicated tool
+- Web operations are subject to the same tool execution security boundary
+
+### 🧠 Context & Memory
+
+- Active file awareness
+- Cursor/selection context
+- Git branch awareness
+- `@filename` references
+- Conversation memory
+- Cross-session memory
+- `/remember` command
 
 ### ⌨️ Keybindings
+
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl+Alt+I` | Open chat |
@@ -42,26 +76,54 @@ Powered by [Ollama](https://ollama.ai) running on your machine. Chat with your A
 | `Ctrl+Alt+A` | Ask about selection |
 | `Ctrl+Alt+E` | Explain selected code |
 
-### 🖱️ Right-Click Menus
-- **Editor:** Ask, Explain, Fix, Generate Tests, Generate Docs
-- **Explorer:** Ask about this file
-- **Editor title:** Open chat icon
+### 🖱️ Context Menus
 
-### 🔐 Security-First Design
-- Every destructive operation requires explicit approval
-- Workspace boundary enforcement
-- Command allowlist (no arbitrary shell execution)
-- Path traversal prevention
-- Symlink attack prevention
-- Full audit log of every operation
+**Editor**
+- Ask
+- Explain
+- Fix
+- Generate Tests
+- Generate Docs
+
+**Explorer**
+- Ask about this file
+
+**Editor Title**
+- Open chat
 
 ---
 
-## Requirements
+## 🔐 Security Architecture
 
-### 1. Ollama Installed and Running
-Download from [ollama.ai](https://ollama.ai) and install.
+Security is the primary architectural requirement of the project.
 
-Start the server:
-```bash
-ollama serve
+The LLM is treated as an **untrusted component**.
+
+It does not receive direct access to the filesystem, terminal, Git, or other system resources.
+
+All tool operations pass through a centralized execution boundary:
+
+```text
+User Request
+     ↓
+    Agent
+     ↓
+    LLM
+     ↓
+ Tool Request
+     ↓
+ Tool Registry
+     ↓
+ToolExecutionGateway
+     ↓
+ Security / Permission Checks
+     ↓
+ User Approval
+     ↓
+ Tool Execution
+     ↓
+   Result
+     ↓
+    Agent
+     ↓
+Final Response
