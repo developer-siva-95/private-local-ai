@@ -9,6 +9,7 @@ const MAX_DIFF_SIZE = 1_000_000;
 
 export class DiffManager {
   private readonly tempDir: string;
+  private diffQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly workspaceRoot: string,
@@ -92,6 +93,51 @@ export class DiffManager {
     newContent: string,
     actionLabel: string,
   ): Promise<boolean> {
+    let resolvePromise!: (value: boolean) => void;
+    const resultPromise = new Promise<boolean>((res) => {
+      resolvePromise = res;
+    });
+
+    /*
+     * Serialize all concurrent diff previews so they wait in line.
+     * This avoids VS Code layout and window focus clashing when Gemma
+     * processes multiple writes/patches in parallel.
+     */
+    this.diffQueue = this.diffQueue
+      .then(async () => {
+        try {
+          const approved = await this.executeShowDiffAndAsk(
+            filePath,
+            oldContent,
+            newContent,
+            actionLabel,
+          );
+          resolvePromise(approved);
+        } catch (error) {
+          this.logger?.error(
+            "Diff queue execution failed",
+            error instanceof Error ? error.message : String(error),
+          );
+          /*
+           * Fail open on diff queue error to preserve fail-safe behavior.
+           */
+          resolvePromise(true);
+        }
+      })
+      .catch((err) => {
+        this.logger?.error("Unhandled diff queue error", String(err));
+        resolvePromise(true);
+      });
+
+    return resultPromise;
+  }
+
+  private async executeShowDiffAndAsk(
+    filePath: string,
+    oldContent: string,
+    newContent: string,
+    actionLabel: string,
+  ): Promise<boolean> {
     const timerId = this.logger?.diffStart(filePath, actionLabel);
 
     const id = randomUUID().slice(0, 8);
@@ -118,6 +164,13 @@ export class DiffManager {
           viewColumn: vscode.ViewColumn.One,
         },
       );
+
+      /*
+       * Brief delay (200ms) to allow VS Code layout transition
+       * and focus changes to complete before opening the prompt.
+       * This prevents focus-stealing from auto-dismissing the warning dialog.
+       */
+      await new Promise((resolve) => setTimeout(resolve, 200));
 
       const choice = await vscode.window.showWarningMessage(
         `Apply changes to ${path.basename(filePath)}?`,

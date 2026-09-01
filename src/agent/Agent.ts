@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { LLMMessage, LLMProvider } from "../llm/LLMProvider.js";
 import type { Tool, ToolContext } from "../tools/Tool.js";
 import { ToolRegistry } from "../tools/ToolRegistry.js";
@@ -47,6 +48,14 @@ export class Agent {
 
   private readonly crossSessionMemory: CrossSessionMemory;
 
+  /*
+   * Tracks the signature of the last executed tool call.
+   * If the model tries to call the same tool with the same
+   * arguments twice in a row, we break the loop and force
+   * a text response. Prevents infinite tool loops.
+   */
+  private lastToolCallSignature = "";
+
   constructor(
     private readonly llmProvider: LLMProvider,
     private readonly toolRegistry: ToolRegistry,
@@ -61,6 +70,7 @@ export class Agent {
 
   clearHistory(): void {
     this.memory.clear();
+    this.lastToolCallSignature = "";
   }
 
   getHistoryLength(): number {
@@ -108,11 +118,7 @@ export class Agent {
     try {
       let actionEnforcerUsed = false;
       let requireToolNextIter = false;
-      /*
-       * Bug 7 fix: toolOutputSummary removed.
-       * It was built every tool call but never used.
-       * Pure memory waste — removed entirely.
-       */
+      let disableToolsNextIter = false;
       let writeToolCalled = false;
 
       for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
@@ -121,16 +127,6 @@ export class Agent {
          *
          * We only stream tokens to chat when we KNOW this
          * iteration's response is the final answer to the user.
-         *
-         * If enforcer might fire and cause a retry, we must
-         * NOT stream this iteration — otherwise the user sees
-         * the intermediate "Sure, I will..." message glued to
-         * the actual final answer in the same chat bubble.
-         *
-         * canStreamThisIter is true when:
-         *   - iteration > 0  (enforcer only fires at iter 0)
-         *   - OR enforcer already used  (won't fire again)
-         *   - OR no intent detected  (enforcer won't fire anyway)
          */
         const intentSource = request.userIntent ?? request.message;
         const canStreamThisIter =
@@ -140,33 +136,31 @@ export class Agent {
 
         const response = await this.llmProvider.generate({
           messages,
-          tools,
+          ...(!disableToolsNextIter ? { tools } : {}),
           ...(request.onToken !== undefined && canStreamThisIter
             ? { onToken: request.onToken }
             : {}),
           ...(request.signal !== undefined ? { signal: request.signal } : {}),
-          ...(requireToolNextIter ? { requireToolCall: true } : {}),
+          ...(requireToolNextIter && !disableToolsNextIter
+            ? { requireToolCall: true }
+            : {}),
         });
 
         /*
-         * Reset flag — only forces one iteration.
+         * Reset flags — only force/disable for one iteration.
          */
         requireToolNextIter = false;
+        disableToolsNextIter = false;
+
         console.log(
           `[AGENT] Iteration ${iteration} response: content=${response.content.length} chars, toolCalls=${response.toolCalls?.length ?? 0}`,
         );
 
         if (!response.toolCalls || response.toolCalls.length === 0) {
-          /*
-           * Use userIntent if provided (raw user text without
-           * injected context). Otherwise fall back to full message.
-           *
-           * This prevents context blocks with filenames like
-           * "active_file: Agent.ts" from triggering the
-           * hasFilename fallback incorrectly.
-           */
-          const intentSource = request.userIntent ?? request.message;
-          const intendedAction = this.detectIntendedAction(intentSource);
+          this.lastToolCallSignature = "";
+
+          const intentSourceInner = request.userIntent ?? request.message;
+          const intendedAction = this.detectIntendedAction(intentSourceInner);
 
           console.log(
             `[AGENT] intendedAction: ${intendedAction === null ? "null" : intendedAction.slice(0, 60)}`,
@@ -174,19 +168,7 @@ export class Agent {
           console.log(
             `[AGENT] enforcer conditions: used=${actionEnforcerUsed}, iter=${iteration}, hasIntent=${intendedAction !== null}`,
           );
-          /*
-           * Detect if this iteration matches the user's intent.
-           *
-           * The enforcer fires when:
-           *   1. Enforcer hasn't been used yet
-           *   2. User has clear intent (modify/create/delete/etc)
-           *   3. Model gave text response with no tool call
-           *   4. AND no write tool was called in previous iterations
-           *      (a read alone doesn't satisfy a modify intent)
-           *
-           * This fixes the case where model reads a file then talks
-           * about changes without actually calling patch_file.
-           */
+
           const isModifyIntent =
             intendedAction !== null &&
             (intendedAction.includes("MODIFY") ||
@@ -202,25 +184,13 @@ export class Agent {
 
           if (shouldFireEnforcer) {
             actionEnforcerUsed = true;
-            requireToolNextIter = true;
+            let autoReadSucceeded = false;
 
-            /*
-             * Auto-read: For modify intents, if the file isn't
-             * already in working memory, read it automatically
-             * BEFORE retrying. This means the model only needs
-             * to call ONE tool (patch_file) instead of two
-             * (read_file then patch_file).
-             *
-             * Small models (7B) reliably call one tool per turn
-             * but struggle with multi-tool sequences. Auto-read
-             * removes the need for the first tool call.
-             */
             if (isModifyIntent) {
-              const fileMatch = intentSource.match(/\b([\w./\\-]+\.\w{1,5})\b/);
+              const fileMatch = intentSourceInner.match(/\b([\w./\\-]+\.\w{1,5})\b/);
 
               if (fileMatch !== null) {
                 const fileName = fileMatch[1]!;
-                const memoryKey = `read_file:${fileName}`;
                 const alreadyInMemory = this.memory
                   .buildMessages("")
                   .some(
@@ -230,10 +200,6 @@ export class Agent {
                   );
 
                 if (!alreadyInMemory) {
-                  /*
-                   * Read the file through the normal tool pipeline.
-                   * This respects all security checks.
-                   */
                   const readTool = this.toolRegistry.get("read_file");
 
                   if (readTool !== undefined) {
@@ -247,6 +213,7 @@ export class Agent {
                     });
 
                     if (readResult.success) {
+                      autoReadSucceeded = true;
                       this.memory.storeToolResult(
                         "read_file",
                         fileName,
@@ -268,42 +235,35 @@ export class Agent {
               }
             }
 
+            requireToolNextIter = !autoReadSucceeded;
+
             messages.push({
               role: "assistant",
               content: response.content,
             });
 
-            messages.push({
-              role: "user",
-              content: intendedAction,
-            });
+            if (autoReadSucceeded) {
+              messages.push({
+                role: "user",
+                content:
+                  "The file content is already provided above. " +
+                  "Answer the user's original question directly in plain text. " +
+                  "Do NOT call any more tools. " +
+                  "Do NOT repeat the file content unless specifically asked. " +
+                  "Just answer what the user asked.",
+              });
+            } else {
+              messages.push({
+                role: "user",
+                content: intendedAction,
+              });
+            }
 
             continue;
           }
 
-          /*
-           * Bug 8 fix: guard content quality.
-           *
-           * If enforcer was used and model still returned
-           * no tool call, only store the turn in memory
-           * if the content is meaningful (>= 10 chars).
-           *
-           * Empty or near-empty responses after enforcer
-           * retry are replaced with a helpful message
-           * but NOT stored as garbage in memory.
-           */
           const contentTrimmed = response.content.trim();
           const isEmpty = contentTrimmed.length === 0;
-
-          /*
-           * Bug 8 fix: only substitute fallback when:
-           *   1. Enforcer was used (we retried with instruction)
-           *   2. Model still returned completely empty content
-           *
-           * Never replace content when enforcer was not used.
-           * Never replace non-empty content regardless.
-           * Short valid responses like "Hello" pass through as-is.
-           */
           const needsFallback = actionEnforcerUsed && isEmpty;
 
           if (!needsFallback) {
@@ -352,6 +312,48 @@ export class Agent {
             };
           }
 
+          /*
+           * Normalize the target to prevent slight variances (e.g. `./file` vs `file`)
+           * from bypassing duplicate detection.
+           */
+          const rawTarget =
+            typeof toolCall.arguments["path"] === "string"
+              ? toolCall.arguments["path"]
+              : typeof toolCall.arguments["command"] === "string"
+                ? toolCall.arguments["command"]
+                : typeof toolCall.arguments["url"] === "string"
+                  ? toolCall.arguments["url"]
+                  : tool.name;
+
+          let normalizedTarget = rawTarget;
+          if (typeof toolCall.arguments["path"] === "string") {
+            normalizedTarget = path
+              .normalize(toolCall.arguments["path"])
+              .replace(/\\/g, "/");
+          }
+
+          const callSignature = `${tool.name}:${normalizedTarget}`;
+
+          if (callSignature === this.lastToolCallSignature) {
+            /*
+             * Model is repeating the exact same call.
+             * Force a text response next iteration by disabling tools.
+             */
+            messages.push({
+              role: "tool",
+              content:
+                `You already called ${tool.name} with these exact arguments ` +
+                `in the previous step and got the result. ` +
+                `Do NOT call this tool again. ` +
+                `Answer the user's question using the data you already have in plain text.`,
+              toolName: tool.name,
+            });
+            disableToolsNextIter = true;
+            continue;
+          }
+
+          this.lastToolCallSignature = callSignature;
+
           const toolResult = await this.toolExecutionGateway.execute({
             tool,
             input: toolCall.arguments,
@@ -381,11 +383,6 @@ export class Agent {
             continue;
           }
 
-          /*
-           * Track if a write/modify tool was successfully called.
-           * This satisfies modify/create/delete intents so we
-           * don't need to fire the enforcer again.
-           */
           const writeToolNames = new Set([
             "write_file",
             "patch_file",
@@ -397,33 +394,14 @@ export class Agent {
             writeToolCalled = true;
           }
 
-          const target =
-            typeof toolCall.arguments["path"] === "string"
-              ? toolCall.arguments["path"]
-              : typeof toolCall.arguments["command"] === "string"
-                ? toolCall.arguments["command"]
-                : typeof toolCall.arguments["url"] === "string"
-                  ? toolCall.arguments["url"]
-                  : tool.name;
+          this.memory.storeToolResult(tool.name, rawTarget, toolResult.output);
 
-          this.memory.storeToolResult(tool.name, target, toolResult.output);
-
-          /*
-           * When a file is written or patched:
-           * 1. Invalidate stale read_file cache
-           * 2. If write_file: store NEW content in cache immediately
-           *    so follow-up questions use current content, not stale
-           */
           if (tool.name === "write_file" || tool.name === "patch_file") {
             const filePath = toolCall.arguments["path"];
 
             if (typeof filePath === "string") {
               this.memory.invalidateToolResult("read_file", filePath);
 
-              /*
-               * For write_file: the new content is known immediately.
-               * Store it so model has fresh content for next turn.
-               */
               if (
                 tool.name === "write_file" &&
                 typeof toolCall.arguments["content"] === "string"
@@ -434,13 +412,6 @@ export class Agent {
                   toolCall.arguments["content"] as string,
                 );
               }
-
-              /*
-               * For patch_file: we don't know the new full content
-               * from the arguments alone. The tool result contains
-               * the outcome. We already invalidate above so model
-               * will re-read if needed. This is the safe approach.
-               */
             }
           }
 
@@ -506,8 +477,6 @@ export class Agent {
       /what(?:'s| is| are) (?:in|inside) \S+\.\w+/,
       /(?:contents?|content) of \S+\.\w+/,
       /(?:name|version|type|main|scripts?) (?:in|of|from) \S+\.\w+/,
-
-      /* Pronoun reference: "show that file", "read it", "open the file" */
       /(?:read|show|open|display|cat|print)\s+(?:that|the|this|it)(?:\s+file)?/,
       /what(?:'s| is| are) (?:in|inside) (?:that|the|this|it)(?:\s+file)?/,
     ];
@@ -527,35 +496,18 @@ export class Agent {
     }
 
     const modifyPatterns = [
-      /* With explicit filename: "change X to Y in file.txt" */
       /(?:change|replace|update|modify|edit|swap)\s+.+(?:to|with|in)\s+\S+\.\w+/,
-
-      /* "change X to Y in file file.txt" */
       /(?:change|replace|update|modify|edit|swap)\s+.+(?:to|with)\s+.+(?:in)\s+\S+\.\w+/,
-
-      /* Reverse: "in file.txt change X" */
       /in\s+\S+\.\w+\s+(?:change|replace|update|modify)/,
-
-      /* Pronoun reference: "change X to Y in that file", "in the file", "in it" */
       /(?:change|replace|update|modify|edit|swap)\s+.+(?:to|with)\s+.+(?:in|to)\s+(?:that|the|this|it)(?:\s+file)?/,
-
-      /* Short pronoun: "change X to Y there" or "in there" */
       /(?:change|replace|update|modify|edit|swap)\s+.+(?:to|with)\s+.+\s+(?:in\s+)?there/,
-
-      /* NEW: Add/inject/insert code into file */
       /(?:add|inject|insert|append)\s+.+\s+(?:to|in|into)\s+\S+\.\w+/,
       /(?:add|inject|insert)\s+.+\s+(?:to|in|into)\s+(?:that|the|this|it)(?:\s+file)?/,
-
-      /* NEW: Refactor patterns */
       /(?:refactor|clean up|improve|optimize)\s+\S+\.\w+/,
       /(?:refactor|clean up|improve|optimize)\s+(?:that|the|this|it)(?:\s+file)?/,
-
-      /* NEW: Wrap in try/catch, add types, etc. */
       /(?:wrap|surround|enclose)\s+.+\s+(?:in|with)\s+/,
       /(?:add|include)\s+(?:error\s+handling|types|comments|docstrings|jsdoc|tsdoc)\s+(?:to|in)\s+\S+\.\w+/,
       /(?:add|include)\s+(?:error\s+handling|types|comments|docstrings|jsdoc|tsdoc)\s+(?:to|in)\s+(?:that|the|this|it)(?:\s+file)?/,
-
-      /* NEW: Remove code from file */
       /(?:remove|delete)\s+.+\s+(?:from|in)\s+\S+\.\w+/,
       /(?:remove|delete)\s+.+\s+(?:from|in)\s+(?:that|the|this|it)(?:\s+file)?/,
     ];
@@ -579,10 +531,6 @@ export class Agent {
       }
     }
 
-    /*
-     * Fix intent — detects "find and fix bugs", "fix this code",
-     * "correct the errors", etc. Forces patch_file tool use.
-     */
     const fixPatterns = [
       /(?:fix|repair|correct)\s+(?:the\s+)?(?:bugs?|errors?|issues?|problems?)\s+in/,
       /(?:find and fix|debug and fix)/,
@@ -603,10 +551,6 @@ export class Agent {
       }
     }
 
-    /*
-     * Generate intent — "generate tests", "write documentation",
-     * "create tests for this". Forces write_file tool use.
-     */
     const generatePatterns = [
       /generate\s+(?:unit\s+)?tests?\s+for/,
       /(?:write|create)\s+(?:unit\s+)?tests?\s+for/,
@@ -630,16 +574,9 @@ export class Agent {
     }
 
     const createPatterns = [
-      /* Direct: "create notes.txt" */
       /(?:create|make|generate|new file|write)\s+\S+\.\w+/,
-
-      /* With article: "create a notes.txt" "make an example.js" */
       /(?:create|make|generate)\s+(?:a |an )?(?:new )?\S+\.\w+/,
-
-      /* With "file called/named": "create a file called notes.txt" */
       /(?:create|make|generate)\s+(?:a |an )?(?:new )?file\s+(?:called|named)\s+\S+\.\w+/,
-
-      /* Reverse: "notes.txt file with content..." */
       /\S+\.\w+\s+(?:file\s+)?with\s+(?:the\s+)?content/,
     ];
 
@@ -708,20 +645,6 @@ export class Agent {
       }
     }
 
-    /*
-     * Pattern: Confirmation intent.
-     *
-     * User replied "yes", "do it", "go ahead", "sure",
-     * "ok", "please", "proceed" — all common ways to
-     * confirm a previously discussed action.
-     *
-     * Force the model to look at conversation history
-     * and execute the previously proposed action.
-     *
-     * This solves the case where model asks "should I
-     * proceed?" and user says "yes" — small models
-     * often forget the pending action and just chat back.
-     */
     const confirmationPatterns = [
       /^(?:yes|yep|yeah|yup|sure|ok|okay|okey)[.!]?$/,
       /^(?:do it|go ahead|proceed|confirm|correct|please)[.!]?$/,

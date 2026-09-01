@@ -19,7 +19,7 @@ export class ToolInputValidator {
   ): ToolValidationResult {
     const schema = tool.inputSchema;
 
-    if (!input || typeof input !== "object") {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
       return {
         valid: false,
         error: "Tool input must be an object.",
@@ -48,11 +48,22 @@ export class ToolInputValidator {
         propertySchema.type === "string" &&
         typeof value !== "string"
       ) {
-        return {
-          valid: false,
-          error: `Field "${propertyName}" must be a string.`,
-        };
+        /*
+         * Allow boolean values for "recursive" parameter in list_directory.
+         * LLMs (like Gemma) frequently emit native JSON booleans (e.g. recursive: true)
+         * for flags even when the schema declares string.
+         */
+        if (typeof value === "boolean" && propertyName === "recursive") {
+          input[propertyName] = String(value);
+        } else {
+          return {
+            valid: false,
+            error: `Field "${propertyName}" must be a string.`,
+          };
+        }
       }
+
+      const finalValue = input[propertyName];
 
       /*
        * Argument size limit.
@@ -60,15 +71,15 @@ export class ToolInputValidator {
        * Prevents LLM from generating enormous arguments.
        */
       if (
-        typeof value === "string" &&
-        value.length > MAX_ARG_CHARS
+        typeof finalValue === "string" &&
+        finalValue.length > MAX_ARG_CHARS
       ) {
         return {
           valid: false,
           error:
             `Field "${propertyName}" exceeds maximum ` +
             `length of ${MAX_ARG_CHARS} characters ` +
-            `(got ${value.length}).`,
+            `(got ${finalValue.length}).`,
         };
       }
     }

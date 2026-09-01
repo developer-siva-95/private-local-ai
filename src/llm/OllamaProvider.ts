@@ -1,4 +1,5 @@
 import type {
+  LLMMessage,
   LLMProvider,
   LLMRequest,
   LLMResponse,
@@ -26,7 +27,6 @@ interface OllamaApiResponse {
 /*
  * Markers that indicate the response contains
  * a raw tool call that was not properly parsed.
- * When detected, we strip and retry.
  */
 const RAW_TOOL_MARKERS = [
   "<｜tool▁call▁begin｜>",
@@ -42,10 +42,6 @@ export class OllamaProvider implements LLMProvider {
   private readonly circuitBreaker: CircuitBreaker;
   private readonly contextSize: number;
 
-  /*
-   * Track which model is currently active.
-   * Switches to fallback if primary fails.
-   */
   private activeModel: string;
 
   constructor(
@@ -65,35 +61,17 @@ export class OllamaProvider implements LLMProvider {
   }
 
   async generate(request: LLMRequest): Promise<LLMResponse> {
-    /*
-     * Circuit breaker check — fail fast if Ollama is down.
-     * Do not waste 30 seconds on a timeout if we already
-     * know Ollama is not responding.
-     */
     if (this.circuitBreaker.isOpen()) {
       throw new Error(this.circuitBreaker.getOpenMessage());
     }
 
     try {
       const result = await this.generateWithModel(request, this.activeModel);
-
-      /*
-       * Success — record for circuit breaker.
-       */
       this.circuitBreaker.recordSuccess();
       return result;
     } catch (error) {
-      /*
-       * Record failure for circuit breaker.
-       * This counts toward the threshold
-       * regardless of error type.
-       */
       this.circuitBreaker.recordFailure();
 
-      /*
-       * Check if this is a model-specific error
-       * and we have a fallback configured.
-       */
       if (this.fallbackModel !== "" && this.isModelError(error)) {
         console.warn(
           `[OllamaProvider] Primary model '${this.activeModel}' failed. ` +
@@ -106,10 +84,6 @@ export class OllamaProvider implements LLMProvider {
             this.fallbackModel,
           );
 
-          /*
-           * Fallback succeeded — record success.
-           * Switch active model for remainder of session.
-           */
           this.circuitBreaker.recordSuccess();
           this.activeModel = this.fallbackModel;
 
@@ -132,49 +106,68 @@ export class OllamaProvider implements LLMProvider {
     }
   }
 
-  /*
-   * Generate a response using a specific model.
-   * Contains all the core generation logic.
-   */
   private async generateWithModel(
     request: LLMRequest,
     model: string,
   ): Promise<LLMResponse> {
+    /*
+     * Format messages for Ollama API compatibility.
+     * 1. Models like Gemma/Llama drop `role: "tool"` in their templates.
+     *    Mapping `tool` -> `user` with explicit prefix ensures all models see tool outputs.
+     * 2. Map camelCase `toolCalls` to snake_case `tool_calls` for Ollama Go backend.
+     */
+    const formattedMessages = request.messages.map((m: LLMMessage) => {
+      if (m.role === "tool") {
+        return {
+          role: "user",
+          content: `[Tool Result for ${m.toolName ?? "tool"}]:\n${m.content}`,
+        };
+      }
+
+      if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+        return {
+          role: "assistant",
+          content:
+            m.content && m.content.trim() !== ""
+              ? m.content
+              : `[Calling tool: ${m.toolCalls.map((t) => t.name).join(", ")}]`,
+          tool_calls: m.toolCalls.map((tc) => ({
+            function: {
+              name: tc.name,
+              arguments: tc.arguments,
+            },
+          })),
+        };
+      }
+
+      return {
+        role: m.role,
+        content: m.content,
+      };
+    });
+
     const requestBody = {
       model,
-      messages: request.messages,
-      tools: request.tools?.map((tool) => ({
-        type: "function",
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.inputSchema,
-        },
-      })),
-      /*
-       * Force tool use when Agent requires it.
-       * "required" makes model call a tool instead of text response.
-       */
+      messages: formattedMessages,
+      ...(request.tools !== undefined
+        ? {
+            tools: request.tools.map((tool) => ({
+              type: "function",
+              function: {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.inputSchema,
+              },
+            })),
+          }
+        : {}),
       ...(request.requireToolCall === true
         ? { tool_choice: "required" as const }
         : {}),
       stream: false,
       options: {
-        /*
-         * Explicit context window size.
-         * Ensures model uses full 8192 token window.
-         */
         num_ctx: this.contextSize,
-        /*
-         * Cap response length.
-         * Prevents runaway generation.
-         * 4096 tokens ≈ 16000 chars — generous for any response.
-         */
         num_predict: 8192,
-        /*
-         * Stop sequences for DeepSeek models.
-         * Prevents hallucinated tool outputs.
-         */
         stop: [
           "<｜tool▁outputs▁begin｜>",
           "<｜tool▁calls▁end｜>\n<｜tool▁outputs▁begin｜>",
@@ -193,10 +186,6 @@ export class OllamaProvider implements LLMProvider {
         body: JSON.stringify(requestBody),
       });
     } catch (error) {
-      /*
-       * Network error — connection refused, timeout etc.
-       * Re-throw for circuit breaker to handle.
-       */
       throw new Error(
         `Network error connecting to Ollama: ` +
           `${error instanceof Error ? error.message : "Unknown"}`,
@@ -213,9 +202,6 @@ export class OllamaProvider implements LLMProvider {
 
     const data = (await response.json()) as OllamaApiResponse;
 
-    /*
-     * Check for API-level error in response body.
-     */
     if (typeof data.error === "string" && data.error !== "") {
       throw new Error(`Ollama error: ${data.error}`);
     }
@@ -230,33 +216,7 @@ export class OllamaProvider implements LLMProvider {
     const rawContent = data.message?.content ?? "";
     const rawToolCalls = data.message?.tool_calls;
 
-    /*
-     * Response quality check — Step 1:
-     * Detect and handle raw tool markers in content.
-     *
-     * If the model emitted DeepSeek-style tool tokens
-     * but our parser failed, the content will contain
-     * visible markers. Strip and retry once.
-     */
-
     const content = this.deduplicateResponse(rawContent.trim());
-
-    /*
-     * Response quality check — Step 2:
-     * Empty or whitespace-only response.
-     *
-     * This happens when the model fails to generate
-     * anything useful. We return empty content and
-     * let the agent handle it (it will retry the turn).
-     */
-    if (
-      content === "" &&
-      (rawToolCalls === undefined || rawToolCalls.length === 0)
-    ) {
-      if (this.debug) {
-        console.log("[OllamaProvider] Empty response received.");
-      }
-    }
 
     let toolCalls: LLMToolCall[] | undefined;
 
@@ -296,12 +256,6 @@ export class OllamaProvider implements LLMProvider {
       }
     }
 
-    /*
-     * Response quality check:
-     * If content has raw tool markers but parsing
-     * completely failed, return empty content.
-     * Better than showing garbage markers to user.
-     */
     if (toolCalls === undefined && this.containsRawToolMarkers(content)) {
       if (this.debug) {
         console.log(
@@ -326,16 +280,6 @@ export class OllamaProvider implements LLMProvider {
     };
   }
 
-  /*
-   * Check if an error is model-specific
-   * (vs network/infrastructure error).
-   *
-   * Model errors: model not found, OOM, context too long.
-   * Network errors: connection refused, timeout.
-   *
-   * Only model errors trigger fallback.
-   * Network errors go to circuit breaker instead.
-   */
   private isModelError(error: unknown): boolean {
     if (!(error instanceof Error)) return false;
 
@@ -350,19 +294,10 @@ export class OllamaProvider implements LLMProvider {
     );
   }
 
-  /*
-   * Check if content contains raw DeepSeek tool markers
-   * that were not successfully parsed.
-   */
   private containsRawToolMarkers(content: string): boolean {
     return RAW_TOOL_MARKERS.some((marker) => content.includes(marker));
   }
 
-  /*
-   * Stream content to a token callback.
-   * Called by Agent AFTER it decides content is final.
-   * Not called automatically during generate().
-   */
   async streamContent(
     content: string,
     onToken: (token: string) => void,
@@ -376,19 +311,9 @@ export class OllamaProvider implements LLMProvider {
     onToken: (token: string) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    console.log(
-      "[STREAM-V2] Streaming",
-      content.length,
-      "chars:",
-      content.slice(0, 60),
-    ); // ADD
     const words = content.split(" ");
 
     for (let i = 0; i < words.length; i++) {
-      /*
-       * Check abort signal before each word.
-       * If aborted, stop immediately.
-       */
       if (signal?.aborted === true) {
         return;
       }
@@ -410,10 +335,6 @@ export class OllamaProvider implements LLMProvider {
   private parseToolCallsFromContent(content: string): LLMToolCall[] {
     const results: LLMToolCall[] = [];
 
-    /*
-     * Pattern 1: Standard JSON format
-     * {"name": "tool_name", "arguments": {...}}
-     */
     const jsonPattern =
       /\{[\s\S]*?"name"\s*:\s*"([^"]+)"[\s\S]*?"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
 
@@ -439,10 +360,6 @@ export class OllamaProvider implements LLMProvider {
 
     if (results.length > 0) return results;
 
-    /*
-     * Pattern 2: DeepSeek special token format.
-     * Handles both singular and plural begin/end tokens.
-     */
     const deepseekPattern =
       /<｜tool▁calls?▁begin｜>(?:<｜tool▁call▁begin｜>)?function<｜tool▁sep｜>(\w+)\s*```(?:json)?\s*(\{[\s\S]*?\})\s*```\s*(?:<｜tool▁call▁end｜>)?(?:<｜tool▁calls?▁end｜>)?/g;
 
@@ -466,9 +383,6 @@ export class OllamaProvider implements LLMProvider {
 
     if (results.length > 0) return results;
 
-    /*
-     * Pattern 3: tool_calls array format in content.
-     */
     const toolCallsArrayPattern = /"tool_calls"\s*:\s*\[([\s\S]*?)\]/g;
 
     while ((match = toolCallsArrayPattern.exec(content)) !== null) {
@@ -497,21 +411,6 @@ export class OllamaProvider implements LLMProvider {
     return results;
   }
 
-  /*
-   * Detect and remove paragraph-level restatements.
-   *
-   * Model sometimes gives answer twice in different formats:
-   *   "The answer is 4, and the answer is 6."
-   *   "The answer to X is:
-   *    - answer: 4
-   *    - answer: 6"
-   *
-   * Strategy:
-   *   1. Split by double newlines (paragraphs)
-   *   2. Extract key numeric/named entities per paragraph
-   *   3. If paragraph 2's entities are subset of paragraph 1,
-   *      drop paragraph 2
-   */
   private removeRestatedParagraphs(content: string): string {
     const paragraphs = content
       .split(/\n\s*\n/)
@@ -527,10 +426,6 @@ export class OllamaProvider implements LLMProvider {
       const current = paragraphs[i]!;
       const currentEntities = this.extractEntities(current);
 
-      /*
-       * If current paragraph's entities are >= 80% subset
-       * of first paragraph, skip (it's a restatement).
-       */
       if (currentEntities.size > 0) {
         let overlap = 0;
         for (const e of currentEntities) {
@@ -547,33 +442,19 @@ export class OllamaProvider implements LLMProvider {
     return kept.join("\n\n");
   }
 
-  /*
-   * Extract entities from text — numbers, quoted strings,
-   * and capitalized identifiers. These are the "facts"
-   * a paragraph conveys.
-   */
   private extractEntities(text: string): Set<string> {
     const entities = new Set<string>();
 
-    /*
-     * Numbers (including decimals).
-     */
     const numbers = text.match(/\b\d+(?:\.\d+)?\b/g);
     if (numbers) {
       for (const n of numbers) entities.add(n);
     }
 
-    /*
-     * Quoted strings.
-     */
     const quoted = text.match(/"([^"]+)"/g);
     if (quoted) {
       for (const q of quoted) entities.add(q.toLowerCase());
     }
 
-    /*
-     * File-like names (word.ext).
-     */
     const files = text.match(/\b[\w-]+\.\w{1,5}\b/g);
     if (files) {
       for (const f of files) entities.add(f.toLowerCase());
@@ -582,42 +463,11 @@ export class OllamaProvider implements LLMProvider {
     return entities;
   }
 
-  /*
-   * Deduplicate near-identical sentences in model output.
-   *
-   * Small models like deepseek-coder-fix often emit
-   * the same information twice with slightly different
-   * wording:
-   *   "The result of the expression 2+2 is 4."
-   *   "The result of 2+2 is 4."
-   *
-   * Uses Jaccard similarity on meaningful words.
-   * Sentences with >= 70% word overlap are duplicates.
-   *
-   * Strategy:
-   *   1. Split by sentence boundaries
-   *   2. Extract meaningful words (no stop words)
-   *   3. Compare to previously kept sentences
-   *   4. Drop if similar to any kept sentence
-   *
-   * Defense in depth: keep this even when using
-   * better models. Copilot and Antigravity both
-   * post-process their model outputs.
-   */
   private deduplicateResponse(content: string): string {
-    console.log("[DEDUP-V2] Called with", content.length, "chars"); // ADD THIS
     if (content.length < 20) return content;
 
-    /*
-     * First pass: remove restated paragraphs.
-     * Handles model saying same answer in two formats.
-     */
     content = this.removeRestatedParagraphs(content);
 
-    /*
-     * Split by sentence boundaries.
-     * Handles missing whitespace after . ! ?
-     */
     const sentenceRegex = /[^.!?]+[.!?]+/g;
     const matches = content.match(sentenceRegex);
 
@@ -634,20 +484,12 @@ export class OllamaProvider implements LLMProvider {
 
       const words = this.extractMeaningfulWords(sentence);
 
-      /*
-       * Very short sentences (< 3 meaningful words):
-       * always keep — likely legitimate short statements.
-       */
       if (words.size < 3) {
         kept.push(sentence);
         keptWordSets.push(words);
         continue;
       }
 
-      /*
-       * Check similarity against every kept sentence.
-       * If >= 70% word overlap → duplicate.
-       */
       let isDuplicate = false;
 
       for (const keptWords of keptWordSets) {
@@ -664,10 +506,6 @@ export class OllamaProvider implements LLMProvider {
       keptWordSets.push(words);
     }
 
-    /*
-     * Preserve any trailing incomplete text after
-     * the last sentence terminator.
-     */
     const lastMatch = matches[matches.length - 1];
     const lastIdx = content.lastIndexOf(lastMatch!) + lastMatch!.length;
     const trailing = content.slice(lastIdx).trim();
@@ -679,83 +517,16 @@ export class OllamaProvider implements LLMProvider {
     return kept.join(" ");
   }
 
-  /*
-   * Extract meaningful words from a sentence.
-   * Removes stop words, punctuation, numbers.
-   * Returns Set for O(1) intersection checks.
-   */
   private extractMeaningfulWords(sentence: string): Set<string> {
     const stopWords = new Set([
-      "a",
-      "an",
-      "the",
-      "is",
-      "are",
-      "was",
-      "were",
-      "be",
-      "been",
-      "being",
-      "of",
-      "in",
-      "on",
-      "at",
-      "to",
-      "for",
-      "with",
-      "by",
-      "from",
-      "into",
-      "and",
-      "or",
-      "but",
-      "not",
-      "no",
-      "yes",
-      "i",
-      "you",
-      "he",
-      "she",
-      "it",
-      "we",
-      "they",
-      "me",
-      "him",
-      "her",
-      "us",
-      "them",
-      "my",
-      "your",
-      "his",
-      "its",
-      "our",
-      "their",
-      "this",
-      "that",
-      "these",
-      "those",
-      "if",
-      "then",
-      "so",
-      "as",
-      "than",
-      "will",
-      "would",
-      "can",
-      "could",
-      "do",
-      "does",
-      "did",
-      "have",
-      "has",
-      "had",
-      "am",
-      "just",
-      "how",
-      "what",
-      "when",
-      "where",
-      "why",
+      "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+      "of", "in", "on", "at", "to", "for", "with", "by", "from", "into",
+      "and", "or", "but", "not", "no", "yes", "i", "you", "he", "she",
+      "it", "we", "they", "me", "him", "her", "us", "them", "my", "your",
+      "his", "its", "our", "their", "this", "that", "these", "those", "if",
+      "then", "so", "as", "than", "will", "would", "can", "could", "do",
+      "does", "did", "have", "has", "had", "am", "just", "how", "what",
+      "when", "where", "why",
     ]);
 
     const words = sentence
@@ -767,12 +538,6 @@ export class OllamaProvider implements LLMProvider {
     return new Set(words);
   }
 
-  /*
-   * Jaccard similarity between two word sets.
-   * Returns 0.0 (nothing in common) to 1.0 (identical).
-   *
-   * Formula: |A ∩ B| / |A ∪ B|
-   */
   private wordSetSimilarity(a: Set<string>, b: Set<string>): number {
     if (a.size === 0 || b.size === 0) return 0;
 
@@ -786,15 +551,6 @@ export class OllamaProvider implements LLMProvider {
   }
 }
 
-/*
- * OllamaHealthCheck
- *
- * Verifies Ollama is running and the required
- * model is available before starting the agent.
- *
- * Gives clear error messages instead of cryptic
- * connection refused errors during inference.
- */
 export class OllamaHealthCheck {
   constructor(
     private readonly baseUrl: string,
@@ -803,9 +559,6 @@ export class OllamaHealthCheck {
   ) {}
 
   async check(): Promise<void> {
-    /*
-     * Step 1: Check Ollama is running.
-     */
     let availableModels: string[] = [];
 
     try {
@@ -838,15 +591,9 @@ export class OllamaHealthCheck {
       );
     }
 
-    /*
-     * Step 2: Check primary model exists.
-     */
     const primaryExists = this.modelExistsIn(this.model, availableModels);
 
     if (!primaryExists) {
-      /*
-       * Check if fallback is available.
-       */
       if (this.fallbackModel !== "") {
         const fallbackExists = this.modelExistsIn(
           this.fallbackModel,
@@ -875,13 +622,8 @@ export class OllamaHealthCheck {
     console.log(`✓ Ollama connected. Model '${this.model}' ready.`);
   }
 
-  /*
-   * Check if a model name exists in the available list.
-   * Matches exact name or name prefix (ignores :tag).
-   */
   private modelExistsIn(modelName: string, available: string[]): boolean {
     const prefix = modelName.split(":")[0] ?? modelName;
-
     return available.some((m) => m === modelName || m.startsWith(prefix));
   }
 }
