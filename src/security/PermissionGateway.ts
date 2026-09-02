@@ -13,6 +13,12 @@ export interface PermissionGatewayRequest {
   permission: Permission;
   target?: string;
   reason: string;
+  /*
+   * Optional working directory for RUN_COMMAND.
+   * Validated through the same path checks as file operations.
+   * Displayed to the user in the approval popup.
+   */
+  cwd?: string;
 }
 
 export class PermissionGateway {
@@ -23,11 +29,6 @@ export class PermissionGateway {
     private readonly auditLog?: AuditLog,
   ) {}
 
-  /*
-   * Full authorization: security checks + user prompt.
-   * This is the standard path for all operations.
-   * NEVER changes — security invariant preserved.
-   */
   async authorize(
     request: PermissionGatewayRequest,
   ): Promise<boolean> {
@@ -46,31 +47,12 @@ export class PermissionGateway {
     return this.permissionManager.check(permissionRequest);
   }
 
-  /*
-   * Security checks only — no user prompt.
-   *
-   * Used when the approval is handled externally
-   * (e.g. VS Code diff preview Apply/Cancel button).
-   *
-   * SECURITY: All path validation, workspace boundary
-   * checks, and real path resolution still run.
-   * Only the user prompt is skipped.
-   *
-   * Returns true if security checks pass.
-   * Returns false if any security check fails.
-   * A false result means the operation is BLOCKED —
-   * it should NOT be shown in the diff at all.
-   */
   async securityCheckOnly(
     request: PermissionGatewayRequest,
   ): Promise<boolean> {
     const securityPassed = await this.runSecurityChecks(request);
 
     if (securityPassed) {
-      /*
-       * Log that this was checked but prompt skipped.
-       * Diff preview will handle user approval.
-       */
       this.auditLog?.logRequest(
         request.permission,
         request.target,
@@ -81,11 +63,6 @@ export class PermissionGateway {
     return securityPassed;
   }
 
-  /*
-   * Internal: run all security checks.
-   * Used by both authorize() and securityCheckOnly().
-   * Extracted to avoid duplication.
-   */
   private async runSecurityChecks(
     request: PermissionGatewayRequest,
   ): Promise<boolean> {
@@ -163,6 +140,51 @@ export class PermissionGateway {
           request.permission,
           request.target,
           commandDecision.reason,
+        );
+        return false;
+      }
+    }
+
+    /*
+     * NEW: Validate cwd for RUN_COMMAND.
+     *
+     * The cwd is a filesystem path, so it must pass the same
+     * logical boundary + real path checks as file operations.
+     *
+     * This prevents the LLM from escaping the workspace by
+     * passing a malicious cwd like "../../Windows/System32".
+     */
+    if (request.permission === Permission.RUN_COMMAND && request.cwd) {
+      const cwdDecision = this.securityPolicy.checkPath(
+        request.cwd,
+        "read",
+      );
+
+      if (!cwdDecision.allowed) {
+        console.log(
+          `\n[SECURITY] Blocked command cwd: ` +
+          `${request.cwd} — ${cwdDecision.reason}`,
+        );
+        this.auditLog?.logSecurityBlock(
+          request.permission,
+          request.cwd,
+          `cwd ${cwdDecision.reason}`,
+        );
+        return false;
+      }
+
+      const cwdRealPathAllowed =
+        await this.workspaceManager.isRealPathAllowed(request.cwd);
+
+      if (!cwdRealPathAllowed) {
+        console.log(
+          `\n[SECURITY] Blocked command cwd: ` +
+          `${request.cwd} — real path escapes workspace.`,
+        );
+        this.auditLog?.logSecurityBlock(
+          request.permission,
+          request.cwd,
+          "cwd real path escapes workspace boundary.",
         );
         return false;
       }

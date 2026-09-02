@@ -32,10 +32,6 @@ const TRANSIENT_ERROR_PATTERNS = [
   "fetch failed",
 ];
 
-/*
- * Tool names that show diff preview before execution.
- * Only write operations that modify file content.
- */
 const DIFF_PREVIEW_TOOLS = new Set(["write_file", "patch_file"]);
 
 function isTransientError(error: string): boolean {
@@ -44,28 +40,10 @@ function isTransientError(error: string): boolean {
 }
 
 export class ToolExecutionGateway {
-  /*
-   * Optional hook for VS Code diff preview.
-   *
-   * When set: called AFTER security checks pass
-   * but BEFORE tool execution.
-   * Returns true to proceed, false to cancel.
-   *
-   * When not set (terminal mode): ignored.
-   * All operations use normal approval flow.
-   *
-   * Security: hook only runs if security checks pass.
-   * A blocked operation never reaches the hook.
-   */
   private beforeExecuteHook:
     | ((toolName: string, input: ToolInput) => Promise<boolean>)
     | undefined;
 
-  /*
-   * Optional hook called AFTER tool execution.
-   * Used for UI cleanup like closing editor tabs
-   * after file deletion. Non-blocking.
-   */
   private afterExecuteHook:
     | ((toolName: string, input: ToolInput, success: boolean) => Promise<void>)
     | undefined;
@@ -75,11 +53,6 @@ export class ToolExecutionGateway {
     private readonly auditLog?: AuditLog,
   ) {}
 
-  /*
-   * Set the diff preview hook.
-   * Called by VS Code extension at startup.
-   * Not called in terminal mode.
-   */
   setBeforeExecuteHook(
     hook: (toolName: string, input: ToolInput) => Promise<boolean>,
   ): void {
@@ -101,45 +74,19 @@ export class ToolExecutionGateway {
 
     const permission = tool.permission;
     const target = this.getSecurityTarget(tool, input);
+    const cwd = this.getSecurityCwd(tool, input);
 
     const permissionRequest = {
       permission,
       reason,
       ...(target !== undefined ? { target } : {}),
+      ...(cwd !== undefined ? { cwd } : {}),
     };
 
-    /*
-     * Determine the authorization path:
-     *
-     * Path A — Diff preview flow (VS Code only):
-     *   Used when: beforeExecuteHook is set AND
-     *              this is a write/patch operation.
-     *
-     *   1. Run security checks only (no prompt)
-     *   2. If security fails → block immediately
-     *   3. If security passes → show diff preview
-     *   4. Diff preview handles user approval (Apply/Cancel)
-     *   5. If cancelled → return cancelled error
-     *   6. If approved → execute tool
-     *
-     * Path B — Normal flow (all other cases):
-     *   Used when: no hook, or not a write operation.
-     *
-     *   1. Run full authorize() = security + user prompt
-     *   2. If denied → block
-     *   3. If approved → execute tool
-     *
-     * Security invariant: path validation, workspace
-     * boundary, and real path checks run in BOTH paths.
-     */
     const useDiffFlow =
       this.beforeExecuteHook !== undefined && DIFF_PREVIEW_TOOLS.has(tool.name);
 
     if (useDiffFlow) {
-      /*
-       * Path A: Security check only.
-       * No user prompt — diff preview handles approval.
-       */
       const securityPassed =
         await this.permissionGateway.securityCheckOnly(permissionRequest);
 
@@ -158,10 +105,6 @@ export class ToolExecutionGateway {
         };
       }
 
-      /*
-       * Security passed. Now show diff preview.
-       * The hook shows the diff and asks Apply/Cancel.
-       */
       const userApproved = await this.beforeExecuteHook!(tool.name, input);
 
       if (!userApproved) {
@@ -178,15 +121,8 @@ export class ToolExecutionGateway {
         };
       }
 
-      /*
-       * Log approval (diff preview = user approved).
-       */
       this.auditLog?.logApproval(permission, target);
     } else {
-      /*
-       * Path B: Normal authorization with user prompt.
-       * Same as always — no change from terminal behavior.
-       */
       const allowed = await this.permissionGateway.authorize(permissionRequest);
 
       if (!allowed) {
@@ -204,10 +140,6 @@ export class ToolExecutionGateway {
       }
     }
 
-    /*
-     * Authorization complete (via either path).
-     * Execute the tool.
-     */
     const controller = new AbortController();
     const enrichedContext: ToolContext = {
       ...context,
@@ -228,10 +160,6 @@ export class ToolExecutionGateway {
         truncatedResult.error,
       );
 
-      /*
-       * After-execute UI hook.
-       * Non-blocking — hook errors never fail tool.
-       */
       if (this.afterExecuteHook !== undefined) {
         try {
           await this.afterExecuteHook(
@@ -354,7 +282,13 @@ export class ToolExecutionGateway {
       case Permission.RUN_COMMAND: {
         const target = input.command;
         if (typeof target !== "string") return undefined;
-        return target;
+        /*
+         * Include cwd in the display target so the user sees
+         * exactly WHERE the command will run in the approval popup.
+         * Example: "npm init -y (in: mysqldbstudy)"
+         */
+        const cwd = typeof input.cwd === "string" ? input.cwd.trim() : "";
+        return cwd !== "" ? `${target} (in: ${cwd})` : target;
       }
       case Permission.GIT_OPERATION: {
         const subcommand = input.subcommand;
@@ -374,5 +308,19 @@ export class ToolExecutionGateway {
       default:
         return undefined;
     }
+  }
+
+  /*
+   * Extract the optional cwd parameter from run_command input.
+   * Passed to the gateway for path validation (logical + realpath).
+   */
+  private getSecurityCwd(tool: Tool, input: ToolInput): string | undefined {
+    if (tool.permission === Permission.RUN_COMMAND) {
+      const cwd = input.cwd;
+      if (typeof cwd === "string" && cwd.trim() !== "") {
+        return cwd.trim();
+      }
+    }
+    return undefined;
   }
 }

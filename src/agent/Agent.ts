@@ -16,21 +16,30 @@ const MAX_TOOL_ITERATIONS = 10;
 const CONTEXT_WINDOW_TOKENS = 8_192;
 const CONTEXT_WARNING_THRESHOLD = 0.7;
 
+const STATE_CHANGING_TOOLS = new Set([
+  "run_command",
+  "write_file",
+  "patch_file",
+  "create_directory",
+  "delete_file",
+  "git_operation",
+]);
+
 export class Agent {
   private readonly toolInputValidator = new ToolInputValidator();
   private readonly memory = new SessionMemory();
 
-  private readonly systemPrompt =
+   private readonly systemPrompt =
     "You are a private AI coding agent with internet access via the web_access tool and local project access via file tools.\n" +
     "RULES:\n" +
     "1. You CAN access files inside the current project using tools.\n" +
     "2. If the user asks about package.json, tsconfig.json, or any project file, use read_file unless you already have the exact content in memory.\n" +
     "3. If the user asks for the value of a specific field or key in a JSON file, answer using the exact key they named. Do not substitute similar keys. For example, 'name' means the exact key 'name', not 'displayName'.\n" +
     "4. Never say you cannot access local files if a tool can solve the request.\n" +
-    "5. New file or full rewrite -> write_file.\n" +
+    "5. New file or full rewrite -> write_file (automatically creates parent directories).\n" +
     "6. Partial edit -> patch_file.\n" +
     "7. Delete file -> delete_file.\n" +
-    "8. Run command -> run_command.\n" +
+    "8. Run command -> run_command. ONLY npm, node, git, and tsc are permitted. Shell commands like mkdir, cd, rm, touch, ls, powershell are STRICTLY PROHIBITED. Chaining with && or || is PROHIBITED. To run a command inside a subdirectory, specify the target path in the cwd parameter (e.g. command: 'npm init -y', cwd: 'mysqldb_study'). Note: run_command automatically creates the cwd directory if it does not exist yet.\n" +
     "9. Latest versions, URLs, documentation, or real-time information -> web_access with a specific URL.\n" +
     "10. After a tool succeeds, answer ONLY the user's actual question. Do not dump the full file unless explicitly asked.\n" +
     "11. Never claim a file was read, written, patched, deleted, or fetched unless you received a successful tool result in this turn.\n" +
@@ -41,20 +50,12 @@ export class Agent {
     "16. Security is enforced outside you. You cannot bypass it.\n" +
     "17. CRITICAL: To modify ANY file, you MUST call patch_file or write_file. Showing edited content in your response does NOT modify the file. The file on disk only changes when a tool is called and succeeds. If you show code without calling a tool, YOU HAVE FAILED THE TASK. After reading a file, if user wants changes, IMMEDIATELY call patch_file. Do not describe what you would do. Do not show the new code. Just call the tool.\n" +
     "18. If the user asks to change, edit, update, replace, or modify content in a file, ALWAYS call patch_file with the search and replace fields. Never just show the edited content without calling the tool.\n" +
-    "19. If the user asks to create a file and gives a filename but no directory, create it in the project root.\n" +
+    "19. To initialize a new project (like a Node.js project) inside a subdirectory, run the standard initialization command using run_command with the subdirectory path passed in cwd (e.g. command: 'npm init -y', cwd: 'mysqldb_study'). Since run_command automatically creates the subdirectory if it is missing, this initializes the project and creates the folder in a single step with only one user approval prompt.\n" +
     "20. If the user replies with a short confirmation like 'yes', 'do it', 'go ahead', proceed with the previously discussed action using the appropriate tool.\n" +
     "21. If the user says to change, replace, or update text in a named file, and both the old text and new text are already given, that is a complete instruction. Use patch_file immediately and do not ask for more details.\n" +
     "22. Always respond in plain readable text. Never wrap responses in JSON, XML, or code blocks unless the user explicitly asks for structured output.";
 
   private readonly crossSessionMemory: CrossSessionMemory;
-
-  /*
-   * Tracks the signature of the last executed tool call.
-   * If the model tries to call the same tool with the same
-   * arguments twice in a row, we break the loop and force
-   * a text response. Prevents infinite tool loops.
-   */
-  private lastToolCallSignature = "";
 
   constructor(
     private readonly llmProvider: LLMProvider,
@@ -70,7 +71,6 @@ export class Agent {
 
   clearHistory(): void {
     this.memory.clear();
-    this.lastToolCallSignature = "";
   }
 
   getHistoryLength(): number {
@@ -98,7 +98,6 @@ export class Agent {
     }
 
     const contextWarning = this.getContextWarning();
-
     const crossSessionContext = this.crossSessionMemory.buildContext();
 
     const systemContent =
@@ -115,6 +114,13 @@ export class Agent {
       .list()
       .map((tool) => this.toLLMToolDefinition(tool));
 
+    /*
+     * Turn-level execution cache.
+     * Prevents the model from re-executing identical tool calls
+     * within the same user turn.
+     */
+    const executedCallsInTurn = new Set<string>();
+
     try {
       let actionEnforcerUsed = false;
       let requireToolNextIter = false;
@@ -122,12 +128,6 @@ export class Agent {
       let writeToolCalled = false;
 
       for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-        /*
-         * Streaming policy — the single biggest UX fix.
-         *
-         * We only stream tokens to chat when we KNOW this
-         * iteration's response is the final answer to the user.
-         */
         const intentSource = request.userIntent ?? request.message;
         const canStreamThisIter =
           iteration > 0 ||
@@ -146,9 +146,6 @@ export class Agent {
             : {}),
         });
 
-        /*
-         * Reset flags — only force/disable for one iteration.
-         */
         requireToolNextIter = false;
         disableToolsNextIter = false;
 
@@ -157,17 +154,8 @@ export class Agent {
         );
 
         if (!response.toolCalls || response.toolCalls.length === 0) {
-          this.lastToolCallSignature = "";
-
           const intentSourceInner = request.userIntent ?? request.message;
           const intendedAction = this.detectIntendedAction(intentSourceInner);
-
-          console.log(
-            `[AGENT] intendedAction: ${intendedAction === null ? "null" : intendedAction.slice(0, 60)}`,
-          );
-          console.log(
-            `[AGENT] enforcer conditions: used=${actionEnforcerUsed}, iter=${iteration}, hasIntent=${intendedAction !== null}`,
-          );
 
           const isModifyIntent =
             intendedAction !== null &&
@@ -313,46 +301,25 @@ export class Agent {
           }
 
           /*
-           * Normalize the target to prevent slight variances (e.g. `./file` vs `file`)
-           * from bypassing duplicate detection.
+           * Turn-level duplicate execution guard:
+           * If this exact tool and arguments were already executed in this turn,
+           * DO NOT prompt the user again. Return cached completion instruction.
            */
-          const rawTarget =
-            typeof toolCall.arguments["path"] === "string"
-              ? toolCall.arguments["path"]
-              : typeof toolCall.arguments["command"] === "string"
-                ? toolCall.arguments["command"]
-                : typeof toolCall.arguments["url"] === "string"
-                  ? toolCall.arguments["url"]
-                  : tool.name;
+          const normalizedArgs = JSON.stringify(toolCall.arguments);
+          const callSignature = `${tool.name}:${normalizedArgs}`;
 
-          let normalizedTarget = rawTarget;
-          if (typeof toolCall.arguments["path"] === "string") {
-            normalizedTarget = path
-              .normalize(toolCall.arguments["path"])
-              .replace(/\\/g, "/");
-          }
-
-          const callSignature = `${tool.name}:${normalizedTarget}`;
-
-          if (callSignature === this.lastToolCallSignature) {
-            /*
-             * Model is repeating the exact same call.
-             * Force a text response next iteration by disabling tools.
-             */
+          if (executedCallsInTurn.has(callSignature)) {
             messages.push({
               role: "tool",
               content:
-                `You already called ${tool.name} with these exact arguments ` +
-                `in the previous step and got the result. ` +
-                `Do NOT call this tool again. ` +
-                `Answer the user's question using the data you already have in plain text.`,
+                `[SYSTEM]: You already executed ${tool.name} with these arguments in this turn. ` +
+                `The action has ALREADY completed. Do NOT call this tool again. ` +
+                `Provide your final answer to the user now in plain text.`,
               toolName: tool.name,
             });
             disableToolsNextIter = true;
             continue;
           }
-
-          this.lastToolCallSignature = callSignature;
 
           const toolResult = await this.toolExecutionGateway.execute({
             tool,
@@ -383,25 +350,30 @@ export class Agent {
             continue;
           }
 
-          const writeToolNames = new Set([
-            "write_file",
-            "patch_file",
-            "delete_file",
-            "run_command",
-          ]);
+          /*
+           * Record successful execution in turn-level cache.
+           */
+          executedCallsInTurn.add(callSignature);
 
-          if (writeToolNames.has(tool.name)) {
+          if (STATE_CHANGING_TOOLS.has(tool.name)) {
             writeToolCalled = true;
           }
+
+          const rawTarget =
+            typeof toolCall.arguments["path"] === "string"
+              ? toolCall.arguments["path"]
+              : typeof toolCall.arguments["command"] === "string"
+                ? toolCall.arguments["command"]
+                : typeof toolCall.arguments["url"] === "string"
+                  ? toolCall.arguments["url"]
+                  : tool.name;
 
           this.memory.storeToolResult(tool.name, rawTarget, toolResult.output);
 
           if (tool.name === "write_file" || tool.name === "patch_file") {
             const filePath = toolCall.arguments["path"];
-
             if (typeof filePath === "string") {
               this.memory.invalidateToolResult("read_file", filePath);
-
               if (
                 tool.name === "write_file" &&
                 typeof toolCall.arguments["content"] === "string"
@@ -415,14 +387,25 @@ export class Agent {
             }
           }
 
-          messages.push({
-            role: "tool",
-            content:
-              `Tool result:\n${toolResult.output}\n\n` +
+          /*
+           * Tailored guidance:
+           * For state-changing tools (run_command, write_file, create_directory),
+           * explicitly instruct the model that the action is complete so it
+           * immediately produces the final text response without re-executing.
+           */
+          const resultMessage = STATE_CHANGING_TOOLS.has(tool.name)
+            ? `Tool result:\n${toolResult.output}\n\n` +
+              `The requested action (${tool.name}) has COMPLETED successfully. ` +
+              `Do NOT call this tool again. ` +
+              `Respond to the user in plain text explaining what was accomplished.`
+            : `Tool result:\n${toolResult.output}\n\n` +
               `Answer the user's exact question using only this data. ` +
               `If the user asked for a specific JSON key or field, return the exact value of that exact key only. ` +
-              `Do not substitute similar fields such as displayName for name. ` +
-              `Do not dump full content unless explicitly asked.`,
+              `Do not dump full content unless explicitly asked.`;
+
+          messages.push({
+            role: "tool",
+            content: resultMessage,
             toolName: tool.name,
           });
         }
